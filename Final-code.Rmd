@@ -1,0 +1,626 @@
+---
+title: "Group Project - Flight Demand"
+author: "Femi Fabiyi, Olivia Fenwick, Todd Livergood"
+date: "Spring Quarter - 2021"
+output: html_document
+---
+
+### Initiate data and libraries
+
+```{r include=FALSE}
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+```
+
+#### Load libraries
+
+```{r}
+library("tseries")
+library(corrplot)
+source("http://www.sthda.com/upload/rquery_cormat.r")
+library(olsrr)
+library(Metrics)
+library(imputeTS)
+library(forecast)
+library(prophet)
+library(bsts)
+library(dplyr)
+library(plotly)
+```
+
+#### Read in data:
+
+```{r}
+airport_pull <- read.csv("Airport Final.csv")
+airport_pull_df <- as.data.frame(airport_pull)
+head(airport_pull_df)
+
+airport_data_original <- read.csv("Airport Data.csv", header=TRUE)
+#head(airport_data_original)
+```
+
+#### Eliminate routes that haven't flown in past year and impute zeros:
+
+```{r}
+# remove routes that haven't flown in past year
+airport_df <- subset(airport_pull_df, select=c('YYYYMM'))
+colname <- c('YYYYMM')
+airport.routes <- colnames(airport_pull_df)
+for (i in 2:(length(airport_pull_df)-1)){
+  if (sum(tail(airport_pull_df[,i], 12))!=0){
+    colname <- c(colname, airport.routes[i])
+    airport_df <- cbind(airport_df, airport_pull_df[,i])
+  }
+}
+colnames(airport_df) <- colname
+
+#head(airport_df)
+```
+
+#### Impute zero to value we would have expected demand to be if the flight had flown
+
+```{r}
+# fill 0 with NA
+airport_df[airport_df==0] <- NA
+
+# fill missing values through linear interpolation
+airport_df <- na_interpolation(airport_df, option='linear')
+#head(airport_df)
+```
+
+#### Split the data into a training and test set (train: 2000-2018, test: 2019)
+
+```{r}
+# train test split
+train <- head(airport_df, n = 240 - 12)
+test <- tail(airport_df, n=12)
+
+# convert to time series
+train_ts <- ts(train, frequency = 12)
+test_ts <- ts(test, frequency = 12)
+```
+
+### Exploratory data analysis
+
+#### Graph data to see cutoff:
+```{r}
+# view all routes
+matplot(airport_df, type="l")
+
+# view biggest route
+matplot(airport_df$MELBOURNE.SYDNEY, type="l")
+
+# view last 24 months (2018/2019) of biggest route
+airport_df_tail <- tail(airport_df,24)
+matplot(airport_df_tail["MELBOURNE.SYDNEY"], type="l")
+```
+
+#### Graph total passengers count by year
+
+```{r}
+# extract total passengers for each year
+all_total_passengers_per_year <- airport_data_original %>%
+  dplyr::select(City.Pair, Year, Passenger.Total)%>%
+  arrange(City.Pair) %>%
+  group_by(Year) %>% summarize(sum(Passenger.Total))#!!sym(alias)
+
+# graph data
+fig <- plot_ly(all_total_passengers_per_year, x = ~Year, y= ~`sum(Passenger.Total)`, color = ~Year, type =  "bar", alpha=0.8)
+fig
+```
+
+#### Graph total passengers count by year by route
+
+```{r}
+# extract total passengers across all routes for specific year
+total_passenger_by_route_for_year <- airport_data_original %>% arrange(Year)%>% 
+  dplyr::select(City.Pair, Year, Passenger.Total)%>% 
+  group_by(City.Pair, Year)%>% 
+  summarize(total_route_flights = sum(Passenger.Total))
+
+# graph data
+fig <- plot_ly(total_passenger_by_route_for_year, x = ~Year, y = ~total_route_flights, color = ~total_route_flights, type =  "box", alpha=0.8)
+fig
+```
+
+#### Graph total passenger by route by month for 2019
+
+```{r}
+# extract total passengers across all routes for specific year
+total_passenger_by_route_for_specific_year <- airport_data_original %>% arrange(Year)%>% 
+  dplyr::select(City.Pair, Year, Passenger.Total)%>% 
+  group_by(City.Pair, Year)%>% 
+  summarize(total_route_flights = sum(Passenger.Total))%>%
+  filter(Year==2019)
+
+# graph data
+fig <- plot_ly(total_passenger_by_route_for_year, x = ~Year, y = ~total_route_flights, color = ~City.Pair, type =  "box", alpha=0.8)
+fig
+```
+
+#### Graph total pax by route by year with error bars
+
+```{r}
+# extract total number of passengers for specific route across for each year
+yearly_total_passenger_by_route <- airport_data_original %>%
+  dplyr::select(City.Pair, Year, Passenger.Total)%>%
+  arrange(City.Pair) #%>% filter( City.Pair == "ADELAIDE-ALICE SPRINGS")
+
+# graph data
+fig <- plot_ly(yearly_total_passenger_by_route,x=~Year, y = ~Passenger.Total, color = ~City.Pair, type =  "box", alpha=0.8)
+fig
+```
+
+#### Graph total passengers by month and year with route filter
+
+```{r}
+# extract total number of passengers for a specific route across the period for each month
+monthly_total_passenger_specific_route <- airport_data_original %>%
+  dplyr::select(City.Pair, Year, Month_num, Passenger.Total)%>%
+  arrange(City.Pair) #%>% filter( City.Pair == "ADELAIDE-ALICE SPRINGS")
+
+# graph data
+fig <- plot_ly(monthly_total_passenger_specific_route,x=~Year, y = ~Month_num, text = ~Passenger.Total, color = ~City.Pair, type =  "scatter")
+fig
+```
+
+#### Run adf and kpss tests on each of the series:
+
+```{r}
+# initiate test summary
+test_summary <- matrix(ncol=4, nrow=length(airport_df))
+for (i in 2:length(airport_df)) {
+  aaa <- adf.test(airport_df[,i])
+  aaa_conc <- if (aaa$p.value <= .05) {"stationary"} else {"non-stationary"}
+  bbb <- kpss.test(airport_df[,i])
+  bbb_conc <- if (bbb$p.value <= .05) {"non-stationary"} else {"stationary"}
+  # update test summary
+  test_summary[i-1,] <- c(aaa$p.value,aaa_conc,bbb$p.value,bbb_conc)
+}
+test_summary <- as.data.frame(test_summary)
+colnames(test_summary) <- c("adf p-value","adf result","kpss p-value","kpss result")
+ 
+head(test_summary)
+```
+
+#### Summarize freq of test values (adf test):
+
+```{r}
+adf_summary <- table(test_summary$`adf result`)
+adf_summary = as.data.frame(adf_summary)
+
+adf_summary
+```
+
+
+#### Summarize freq of test values (kpss test):
+
+```{r}
+kpss_summary <- table(test_summary$`kpss result`)
+kpss_summary = as.data.frame(kpss_summary)
+
+kpss_summary
+```
+
+#### View acf of most pupular route:
+
+```{r}
+acf(airport_df["MELBOURNE.SYDNEY"])
+```
+
+#### Correlation matrix (Note: Commenting this out as it was printing multiple pages when knitting.)
+```{r}
+# airport_df_temp = subset(airport_df, select = -c(YYYYMM))
+# rquery.cormat(airport_df_temp)
+```
+
+
+
+### Build models
+
+```{r}
+routes <- colnames(train_ts)
+routes <- tail(routes, length(routes)-1)
+
+# initiate model summary table
+model_aa_summary <- data.frame(route = character(), model_name = character(), AIC = double(), AICc = double(), BIC = double(), sMAPE = double())
+```
+
+#### auto.arima 
+
+```{r}
+# create future forecast dataframe
+SARIMA.forecast <- data.frame(c(1,2,3,4,5,6,7,8,9,10,11,12,1,2,3,4,5,6,7,8,9,10,11,12))
+names(SARIMA.forecast) <- c("Month")
+counter <- 2
+
+for (i in routes) {
+  # calculate auto.arima for route i
+  route_x <- train_ts[,i]
+  model_aa_x <- auto.arima(route_x)
+  res_x <- model_aa_x$residuals
+  res_x_ts <- ts(res_x)
+  route <- i
+  # save AIC/AICc/BIC
+  aic <- model_aa_x$aic
+  aicc <- model_aa_x$aicc
+  bic <- model_aa_x$bic
+  # generate model forecast
+  fc_x <- as.data.frame(forecast(model_aa_x),h=12)
+  model_aa_forecast <- fc_x$`Point Forecast`
+  # update forecast dataframe
+  forecast.i.df <- as.data.frame(forecast(model_aa_x),h=24)
+  forecast.i <- forecast.i.df$`Point Forecast`
+  SARIMA.forecast <- cbind(SARIMA.forecast, forecast.i)
+  colnames(SARIMA.forecast)[counter] <- route
+  counter = counter + 1
+  # calculate sMAPE
+  sMAPE_x <- smape(test[,i],model_aa_forecast)
+  # update model summary tale
+  model_aa_summary <- rbind(model_aa_summary, c(route,"SARIMA",round(aic, digits = 2),round(aicc,digits = 2),round(bic,digits = 2),sMAPE_x))
+}
+
+# rename columns of model summary table
+colnames(model_aa_summary) <- c("Route", "Model","AIC","AICC","BIC","sMAPE")
+head(model_aa_summary)
+
+# update arima forecast to just 2022 forecast
+SARIMA.forecast <- tail(SARIMA.forecast, 12)
+#head(SARIMA.forecast)
+```
+
+#### Holt Winters (multiplicative seasonality and additive seasonality)
+
+```{r}
+# create future forecast dataframe
+HW.add.forecast <- data.frame(c(1,2,3,4,5,6,7,8,9,10,11,12,1,2,3,4,5,6,7,8,9,10,11,12))
+names(HW.add.forecast) <- c("Month")
+HW.mult.forecast <- data.frame(c(1,2,3,4,5,6,7,8,9,10,11,12,1,2,3,4,5,6,7,8,9,10,11,12))
+names(HW.mult.forecast) <- c("Month")
+counter <- 2
+
+for (i in routes) {
+  # calculate holt-winters for route i
+  route_x <- train_ts[,i]
+  model_hw_add <- hw(route_x,seasonal="additive")
+  model_hw_mult <- hw(route_x,seasonal="multiplicative")
+  route <- i
+  # save AIC/AICc/BIC
+  aic_add <- model_hw_add$model$aic
+  aicc_add <- model_hw_add$model$aicc
+  bic_add <- model_hw_add$model$bic
+  aic_mult <- model_hw_mult$model$aic
+  aicc_mult <- model_hw_mult$model$aicc
+  bic_mult <- model_hw_mult$model$bic
+  # generate the forecast
+  fc_x_add <- as.data.frame(forecast(model_hw_add),h=12)
+  model_aa_forecast_add <- fc_x_add$`Point Forecast`
+  fc_x_mult <- as.data.frame(forecast(model_hw_mult),h=12)
+  model_aa_forecast_mult <- fc_x_mult$`Point Forecast`
+  # update forecast dataframe
+  forecast.i.df <- as.data.frame(forecast(model_hw_add),h=24)
+  forecast.i <- forecast.i.df$`Point Forecast`
+  HW.add.forecast <- cbind(HW.add.forecast, forecast.i)
+  colnames(HW.add.forecast)[counter] <- route
+  forecast.i.df <- as.data.frame(forecast(model_hw_mult),h=24)
+  forecast.i <- forecast.i.df$`Point Forecast`
+  HW.mult.forecast <- cbind(HW.mult.forecast, forecast.i)
+  colnames(HW.mult.forecast)[counter] <- route
+  counter = counter + 1
+  # calculate sMAPE
+  sMAPE_x_add <- smape(test[,i],model_aa_forecast_add)
+  sMAPE_x_mult <- smape(test[,i],model_aa_forecast_mult)
+  # update the model summary
+  model_aa_summary <- rbind(model_aa_summary, c(route, "HW-add.", aic_add, aicc_add, bic_add, sMAPE_x_add))
+  model_aa_summary <- rbind(model_aa_summary, c(route, "HW-mult.", aic_mult, aicc_mult, bic_mult, sMAPE_x_mult))
+}
+
+tail(model_aa_summary)
+
+# update HW forecast to just 2022 forecast
+HW.add.forecast <- tail(HW.add.forecast, 12)
+#head(HW.add.forecast)
+HW.mult.forecast <- tail(HW.mult.forecast, 12)
+#head(HW.mult.forecast)
+```
+
+#### Prophet
+
+```{r}
+# create future forecast dataframe
+prophet.forecast <- data.frame(c(1,2,3,4,5,6,7,8,9,10,11,12))
+names(prophet.forecast) <- c("Month")
+counter <- 3
+
+for (i in routes) {
+  # calculate prophet for route i
+  model_prophet_x <- data.frame(ds = seq(as.Date('2000-01-01'),as.Date('2018-12-01'), by = 'm'), y = train[,i])
+  m <- prophet(model_prophet_x)
+  route <- i
+  future <- make_future_dataframe(m, periods = 12, freq = 'month')
+  # generate forecast
+  forecast <- predict(m, future)
+  forecast_tail <- tail(forecast,12)
+  # update forecast dataframe
+  future2 <- make_future_dataframe(m, periods = 24, freq = 'month')
+  forecast2 <- predict(m, future2)
+  forecast_tail2 <- tail(forecast2,12)
+  prophet.forecast <- cbind(prophet.forecast, forecast_tail2)
+  colnames(prophet.forecast)[counter] <- route
+  counter = counter + 1
+  # calculate sMAPE
+  sMAPE_prophet <- smape(test[,i],forecast_tail$yhat)
+  # update model summary
+  model_aa_summary <- rbind(model_aa_summary, c(route, "Phophet", 999999, 999999, 999999, sMAPE_prophet))
+}  
+
+tail(model_aa_summary)
+
+#head(prophet.forecast)
+```
+
+### Seasonal Decomposition of Time Series by Loess (STL - only additive and requires box cos to handle multiplicative)
+
+```{r}
+# create future forecast dataframe
+STL.forecast <- data.frame(c(1,2,3,4,5,6,7,8,9,10,11,12,1,2,3,4,5,6,7,8,9,10,11,12))
+names(STL.forecast) <- c("Month")
+counter <- 2
+
+for (i in routes) {
+  # calculate STL for route i
+  s.7 <-stl(train_ts[,i], s.window= 7, robust = TRUE)
+  route <- i
+  # generate forecast
+  forecast_stl <- forecast(s.7, h = 12)
+  fc_stl1 <- as.data.frame(forecast_stl)
+  model_aa_forecast_stl1 <- fc_stl1$`Point Forecast`
+  # update forecast dataframe
+  forecast.i.df <- as.data.frame(forecast(s.7, h = 24))
+  forecast.i <- forecast.i.df$`Point Forecast`
+  STL.forecast <- cbind(STL.forecast, forecast.i)
+  colnames(STL.forecast)[counter] <- route
+  counter = counter + 1
+  # calculate # sMAPE
+  sMAPE_x_stl1 <- smape(test[,i],model_aa_forecast_stl1)
+  # update model summary
+  model_aa_summary <- rbind(model_aa_summary, c(route, "STL", 999999, 999999, 999999, sMAPE_x_stl1))
+}  
+
+tail(model_aa_summary)
+
+# update STL forecast to just 2022 forecast
+STL.forecast <- tail(STL.forecast, 12)
+#head(STL.forecast)
+```
+
+#### BSTS
+
+```{r}
+# create future forecast dataframe
+BSTS.forecast <- data.frame(c(1,2,3,4,5,6,7,8,9,10,11,12,1,2,3,4,5,6,7,8,9,10,11,12))
+names(BSTS.forecast) <- c("Month")
+counter <- 2
+
+for (i in routes) {
+  # calculate BSTS for route i
+  route <- i
+  y <-log10(train_ts[,i])
+  y_test_log <- log10(test[,i])
+  ss <- AddLocalLinearTrend(list(), y)
+  ss <- AddSeasonal(ss, y, nseasons= 12)
+  model_bsts <- bsts(y, state.specification= ss, niter = 100)
+  # generate forecast
+  pred <- predict.bsts(model_bsts, horizon = 12, quantiles = c(.025, .975))
+  # update forecast dataframe
+  pred2 <- predict.bsts(model_bsts, horizon = 24, quantiles = c(.025, .975))
+  e_pred <- 10^(pred2$mean)
+  BSTS.forecast <- cbind(BSTS.forecast, e_pred)
+  colnames(BSTS.forecast)[counter] <- route
+  counter = counter + 1
+  # calculate sMAPE after "untransforming" the data:
+  y_test_log_back <- 10^(y_test_log)
+  pred_back <- 10^(pred$mean)
+  sMAPE_bsts <- smape(y_test_log_back,pred_back)
+  
+  # update model summary
+  model_aa_summary <- rbind(model_aa_summary, c(route, "BSTS", 999999, 999999, 999999, sMAPE_bsts))
+}  
+
+tail(model_aa_summary)
+
+# update BSTS forecast to just 2022 forecast
+BSTS.forecast <- tail(BSTS.forecast, 12)
+#head(BSTS.forecast)
+```
+
+### Model comparison
+
+```{r}
+
+model_aa_summary_final <- transform(model_aa_summary, sMAPE = as.numeric(sMAPE))
+
+# mean:
+mean_sMAPE <- model_aa_summary_final %>% group_by(Model) %>% summarise_at(c("sMAPE"),mean)
+mean_sMAPE$sMAPE <- round(mean_sMAPE$sMAPE ,4)
+mean_sMAPE <- mean_sMAPE[order(mean_sMAPE$sMAPE),]
+
+# median:
+median_sMAPE <- model_aa_summary_final %>% group_by(Model) %>% summarise_at(c("sMAPE"),median)
+median_sMAPE$sMAPE <- round(median_sMAPE$sMAPE ,4)
+median_sMAPE <- median_sMAPE[order(median_sMAPE$sMAPE),]
+```
+
+#### View graph of models by average
+
+```{r}
+# mean
+par(mar=c(8,6,6,6))
+xx <- barplot(mean_sMAPE$sMAPE, main="Mean sMAPE", xlab="Model", names.arg = mean_sMAPE$Model, las = 2, ylim = c(0,.1))
+text(x = xx, y = mean_sMAPE$sMAPE, label = mean_sMAPE$sMAPE, pos = 3, cex = 0.8, col = "red")
+
+# median
+par(mar=c(8,6,6,6))
+yy <- barplot(median_sMAPE$sMAPE, main="Median sMAPE", xlab="Model", names.arg = median_sMAPE$Model, las = 2, ylim = c(0,.1))
+text(x = yy, y = median_sMAPE$sMAPE, label = median_sMAPE$sMAPE, pos = 3, cex = 0.8, col = "red")
+
+```
+
+#### Save forecasts to csv
+
+```{r}
+# ARIMA
+write.csv(SARIMA.forecast, 'SARIMA forecast.csv', row.names=FALSE)
+
+# HW add
+write.csv(HW.add.forecast, 'HW add forecast.csv', row.names=FALSE)
+
+# HW mult
+write.csv(HW.mult.forecast, 'HW mult forecast.csv', row.names=FALSE)
+
+# prophet
+write.csv(prophet.forecast, 'prophet forecast.csv', row.names=FALSE)
+
+# STL
+write.csv(STL.forecast, 'STL forecast.csv', row.names=FALSE)
+
+# BSTS
+write.csv(BSTS.forecast, 'BSTS forecast.csv', row.names=FALSE)
+```
+
+#### STL Route-specific plots (enter route into ii value):
+
+```{r}
+# specify route
+ii <- "MELBOURNE.SYDNEY"
+
+s.7 <-stl(train_ts[,ii], s.window= 7, robust = TRUE)
+route <- ii
+# generate forecast
+forecast_stl <- forecast(s.7, h = 12)
+fc_stl1 <- as.data.frame(forecast_stl)
+model_aa_forecast_stl1 <- fc_stl1$`Point Forecast`
+#plot(model_aa_forecast_stl1, main=ii)
+
+# plot actual vs forecast
+plot(test[,ii], main=ii, xlab = "Month", ylab = "Passenger Count", type='l')  
+lines(model_aa_forecast_stl1, col='red')
+
+```
+
+
+#### Plot forecasts vs actual test for different models (to include in slides):
+```{r}
+#i <- "MELBOURNE-SYDNEY"
+i <- "MELBOURNE.SYDNEY"
+ii <- test$`MELBOURNE.SYDNEY`
+#train_ts[,"MELBOURNE-SYDNEY"]
+
+#train_ts
+
+##SARIMA (red):
+route_x_chart <- train_ts[,i]
+model_aa_x_chart <- auto.arima(route_x_chart)
+fc_x_chart <- as.data.frame(forecast(model_aa_x_chart, h=12))
+
+##HW :
+model_hw_add_chart <- hw(route_x_chart,seasonal="additive")
+model_hw_mult_chart <- hw(route_x_chart,seasonal="multiplicative")
+
+fc_x_chart_hwadd <- as.data.frame(forecast(model_hw_add_chart, h=12))
+fc_x_chart_hwmult <- as.data.frame(forecast(model_hw_mult_chart, h=12))
+
+##STL:
+s.7_chart <-stl(route_x_chart, s.window= 7, robust = TRUE)
+forecast_stl_chart <- forecast(s.7_chart, h = 12)
+fc_stl1_chart <- as.data.frame(forecast_stl_chart)
+
+
+##Prophet:
+model_prophet_x_chart <- data.frame(ds = seq(as.Date('2000-01-01'),as.Date('2018-12-01'), by = 'm'), y = train[,i])
+m_chart <- prophet(model_prophet_x_chart)
+future_chart <- make_future_dataframe(m_chart, periods = 12, freq = 'month')
+forecast_prophet_chart <- predict(m_chart, future_chart)
+forecast_tail_chart <- tail(forecast_prophet_chart,12)
+
+
+##BSTS:
+y_chart <-log10(route_x_chart)
+y_test_log_chart <- log10(test[,i])
+ss_chart <-AddLocalLinearTrend(list(), y_chart)
+ss_chart <-AddSeasonal(ss_chart, y_chart, nseasons= 12)
+model_bsts_chart <-bsts(y_chart, state.specification= ss_chart, niter = 100)
+pred_chart<-predict.bsts(model_bsts_chart, horizon = 12, quantiles = c(.025, .975))
+e_pred_chart <- 10^(pred_chart$mean)
+
+
+##Plot the charts:
+plot(ii, main=i, ylab = "Passenger Count", xlab = "Month in 2019", ylim = c(700000,850000))
+lines(fc_x_chart$`Point Forecast`, col='red')
+lines(fc_x_chart_hwadd$`Point Forecast`, col='blue')
+lines(fc_x_chart_hwmult$`Point Forecast`, col='green')
+lines(fc_stl1_chart$`Point Forecast`, col='black')
+lines(forecast_tail_chart$yhat, col='purple')
+lines(e_pred_chart, col='orange')
+
+```
+
+
+#### Deep learning model using MPL - Please note that due to the time it takes to run this, we've commented the code out for purposes of printing this out into html.  Please
+#### refer to slides for output of the model.
+```{r}
+########### Pattern Matching ############
+#Deep Learning
+# start.time <- Sys.time()
+# 
+# fit_dl <-mlp(train_ts[,"ADELAIDE.ALICE.SPRINGS"], hd.auto.type="cv")
+# plot(fit_dl)
+# frc2 <-forecast(fit_dl, h=12)
+# print(frc2)
+# plot(frc2, main = "ADELAIDE.ALICE.SPRINGS")
+# 
+# end.time <- Sys.time()
+# time.taken <- round(end.time - start.time,2)
+# time.taken
+# 
+# 
+# #frc2
+# frc2_df <- as.data.frame(frc2)
+# frc2_df <- as.numeric(unlist(frc2_df))
+# #frc2_df
+# 
+# plot(test[,"ADELAIDE.ALICE.SPRINGS"], main="ADELAIDE.ALICE.SPRINGS", xlab = "Month", ylab = "Passenger Count")  
+# lines(frc2_df, col='red')
+# 
+# 
+# #### Compare smapes of NN vs StL:
+# STL_smape <- model_aa_summary %>% filter(Route == "ADELAIDE.ALICE.SPRINGS") %>% filter(Model == "STL")
+# STL_smape <- STL_smape$sMAPE
+# STL_smape
+# 
+# NN_smape <- smape(frc2_df,test[,"ADELAIDE.ALICE.SPRINGS"])
+# NN_smape
+# 
+# #### Simple bar chart of 2 smape values:
+# smape_contest <- data.frame(route = character(), model_name = character(), sMAPE = double())
+# smape_contest <- rbind(smape_contest, c("ADELAIDE.ALICE.SPRINGS","STL",STL_smape))
+# smape_contest <- rbind(smape_contest, c("ADELAIDE.ALICE.SPRINGS","MLP",NN_smape))
+# colnames(smape_contest) <- c("Route","Model","sMAPE")
+# smape_contest$sMAPE <- as.numeric(smape_contest$sMAPE)
+# 
+# 
+# smape_contest$sMAPE <- round(smape_contest$sMAPE,4)
+# 
+# par(mar=c(8,6,6,6))
+# yy_smape <- barplot(smape_contest$sMAPE, main="sMAPE: ADELAIDE.ALICE.SPRINGS", xlab="Model", names.arg = smape_contest$Model, las = 2, ylim = c(0,.20))
+# text(x = yy_smape, y = smape_contest$sMAPE, label = smape_contest$sMAPE, pos = 3, cex = 0.8, col = "red")
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
